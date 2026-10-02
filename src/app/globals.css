@@ -1,5 +1,5 @@
 @import "tailwindcss";
-@import "tw-animate-css";
+/* tw-animate-css 在嵌套项目结构下触发 Turbopack panic，改用 tailwindcss-animate 插件（tailwind.config.ts 已注册） */
 
 @custom-variant dark (&:is(.dark *));
 
