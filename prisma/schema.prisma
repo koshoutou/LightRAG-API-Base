@@ -1,0 +1,374 @@
+// LightRAG-API-Base · Prisma Schema
+// 企业级 Qdrant 检索审计网关（只读 + 控制面）· 多租户计量
+// 数据库仅承载"控制面"元数据（租户/API Key/审计/计量/日志），不承载向量数据。
+// 向量数据始终在 Qdrant，本网关仅通过 Qdrant REST API 只读检索。
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// 平台设置（单行，id="default"）—— Qdrant 连接 + Embedding + Rerank + 默认检索参数
+// ---------------------------------------------------------------------------
+model Setting {
+  id String @id @default("default")
+
+  // ---- Qdrant 连接（只读检索目标）----
+  qdrantUrl String @default("")
+  qdrantApiKey String @default("")
+
+  // ---- Embedding 模型（OpenAI 兼容 /v1/embeddings）----
+  /// 警告：必须与向量入库时使用的嵌入服务/模型完全一致，否则向量空间不匹配
+  embedApiBase String @default("")
+  embedApiKey String @default("")
+  embedModel String @default("")
+  /// 探测出的向量维度（0=未知，检索时按 KB 注册维度或 1024 兜底）
+  embedDim Int @default(0)
+
+  // ---- Rerank 模型（OpenAI 兼容 /v1/rerank）----
+  /// 警告：必须与入库/检索侧使用的重排模型一致，否则重排序结果不可对比
+  rerankApiBase String @default("")
+  rerankApiKey String @default("")
+  rerankModel String @default("")
+
+  // ---- 默认检索参数（与 LightRAG-Base runSearch 对齐）----
+  defaultTopK Int @default(5)
+  defaultPrefetchLimit Int @default(50)
+  defaultMode String @default("hybrid") // hybrid | dense | sparse
+  defaultRerank Boolean @default(false)
+  defaultFusion String @default("rrf") // rrf | dbsf
+  defaultRrfK Int @default(60)
+  /// RRF 权重 [dense, sparse]，JSON number[2]
+  defaultRrfWeights String @default("[0.5,0.5]")
+
+  // ---- 限流默认（租户未配置时兜底）----
+  defaultRatePerMin Int @default(60)
+  defaultDailyQuota Int @default(10000) // -1 = 无限
+
+  // ---- 日志保留（天，过期自动清理）----
+  callLogRetentionDays Int @default(30)
+  rerankLogRetentionDays Int @default(30)
+  auditLogRetentionDays Int @default(365)
+
+  // ---- 平台开关 ----
+  /// 全局只读熔断（紧急止血时开启，所有检索直接返回 503）
+  readonlyCircuitBreaker Boolean @default(false)
+  /// 是否允许跨租户 KB 共享检索（false=KB 必须归属请求租户）
+  allowCrossTenantKb Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// 租户（多租户隔离的顶层主体）
+// ---------------------------------------------------------------------------
+model Tenant {
+  id String @id @default(cuid())
+  name String @unique
+  /// 短标识，用于路由 / API Key 前缀映射
+  slug String @unique
+  enabled Boolean @default(true)
+  description String @default("")
+
+  // ---- 配额与限流 ----
+  /// 每分钟请求数上限（0 = 跟随平台默认；-1 = 无限）
+  ratePerMin Int @default(0)
+  /// 每日检索配额（0 = 跟随默认；-1 = 无限）
+  dailyQuota Int @default(0)
+
+  // ---- 计费元信息 ----
+  /// 联系人/归属团队
+  contact String @default("")
+  /// 元数据 JSON（标签、计费档位等）
+  metaJson String @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  apiKeys ApiKey[]
+  kbMappings KbMapping[]
+  callLogs CallLog[]
+  rerankLogs RerankLog[]
+  auditLogs AuditLog[]
+  usageRecords UsageRecord[]
+
+  @@index([slug])
+}
+
+// ---------------------------------------------------------------------------
+// API Key（鉴权凭据）—— 仅存哈希，明文仅创建时返回一次
+// ---------------------------------------------------------------------------
+model ApiKey {
+  id String @id @default(cuid())
+  tenantId String
+  name String
+
+  /// SHA-256(key) 十六进制，校验时哈希比对
+  keyHash String @unique
+  /// 前缀用于展示（如 rag-ab12****），不泄露完整 key
+  keyPrefix String
+  /// 完整 key 的格式标识：rag- | lra- 等
+  keyFormat String @default("lra")
+
+  /// readonly | operator | admin
+  role String @default("readonly")
+  enabled Boolean @default(true)
+
+  /// 0 = 跟随租户；-1 = 无限；>0 = 覆盖
+  ratePerMinOverride Int @default(0)
+  /// 0 = 跟随租户；-1 = 无限；>0 = 覆盖
+  dailyQuotaOverride Int @default(0)
+
+  expiresAt DateTime?
+  lastUsedAt DateTime?
+  callCount Int @default(0)
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  callLogs CallLog[]
+
+  @@index([tenantId])
+  @@index([keyHash])
+  @@index([enabled])
+}
+
+// ---------------------------------------------------------------------------
+// 知识库映射（租户 → kbId → Qdrant collection）
+// 本网关不管理 KB 生命周期，仅注册"哪个租户可以检索哪个集合"
+// ---------------------------------------------------------------------------
+model KbMapping {
+  id String @id @default(cuid())
+  tenantId String
+  /// LightRAG-Base 知识库 ID（ cuid ）
+  kbId String
+  /// Qdrant collection 名（ kb_xxx ）
+  collection String
+  /// 友好名
+  name String @default("")
+  /// 向量维度（一致性校验/兜底用）
+  dim Int @default(0)
+  /// 入库时使用的嵌入模型（一致性提醒用）
+  embeddingModel String @default("")
+  enabled Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, kbId])
+  @@index([kbId])
+  @@index([collection])
+}
+
+// ---------------------------------------------------------------------------
+// 检索调用日志（每次 /api/v1/search 一条）—— 完整可回放
+// ---------------------------------------------------------------------------
+model CallLog {
+  id String @id @default(cuid())
+  tenantId String
+  apiKeyId String?
+  /// external | admin | debug | internal-healthcheck
+  source String @default("external")
+
+  kbId String
+  collection String
+  query String
+
+  /// hybrid | dense | sparse
+  mode String
+  topK Int
+  prefetchLimit Int
+  rerank Boolean
+  fusion String @default("rrf")
+  rrfK Int @default(60)
+  rrfWeightsJson String @default("[0.5,0.5]")
+  /// 过滤条件 JSON { docIds?, pageRange?, extra? }
+  filterJson String @default("{}")
+  /// 调试参数 JSON（debug.fusion/rrfK/rrfWeights/prefetchLimit）
+  debugJson String @default("{}")
+
+  // ---- 各阶段耗时 ----
+  tookMs Int
+  embedMs Int @default(0)
+  recallMs Int @default(0)
+  fusionMs Int @default(0)
+  rerankMs Int @default(0)
+  contextMs Int @default(0)
+
+  // ---- 结果 ----
+  resultCount Int @default(0)
+  /// Top N 结果摘要 JSON [{chunkId, score, rerankScore?, docId, page, docType}]
+  resultsJson String @default("[]")
+  /// 嵌入指纹（dim + dense 前8维 hash + sparse nnz + provider）
+  embedFingerprintJson String @default("{}")
+
+  // ---- 状态 ----
+  /// ok | error | ratelimited | unauthorized | circuit_open | upstream_error
+  status String @default("ok")
+  httpStatus Int @default(200)
+  errorCode String?
+  errorMessage String?
+
+  // ---- 客户端 ----
+  clientIp String @default("")
+  userAgent String @default("")
+  requestId String @default("")
+
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  apiKey ApiKey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+  rerankLog RerankLog?
+
+  @@index([tenantId, createdAt])
+  @@index([kbId, createdAt])
+  @@index([status, createdAt])
+  @@index([apiKeyId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// 重排序结果日志（CallLog 1:1，仅当 rerank=true 时产生）
+// 保留重排输入候选 + 重排输出 + 原始 provider 响应
+// ---------------------------------------------------------------------------
+model RerankLog {
+  id String @id @default(cuid())
+  callLogId String @unique
+  tenantId String
+  query String
+
+  /// 输入候选 JSON [{chunkId, preview, prevRank, prevScore}]
+  candidatesJson String @default("[]")
+  /// 重排输出 JSON [{chunkId, rerankScore, prevRank, newRank, delta}]
+  resultsJson String @default("[]")
+  /// 使用的 rerank 模型
+  model String
+  topN Int
+  tookMs Int
+
+  /// provider 原始响应（截断 8KB）
+  providerRawJson String @default("{}")
+  /// provider 名称（openai-compatible | disabled | error）
+  provider String @default("openai-compatible")
+
+  createdAt DateTime @default(now())
+
+  callLog CallLog @relation(fields: [callLogId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([callLogId])
+}
+
+// ---------------------------------------------------------------------------
+// 审计日志（管理操作 + 关键安全事件）
+// ---------------------------------------------------------------------------
+model AuditLog {
+  id String @id @default(cuid())
+  /// nullable：系统级事件无租户
+  tenantId String?
+  /// 操作主体：admin:{id} | system | apikey:{id} | bootstrap
+  actor String
+  /// 动作：apikey.create | apikey.revoke | setting.update | tenant.update | kbmap.update | admin.login ...
+  action String
+  /// 目标类型：tenant | apikey | setting | kbmap | calllog | admin | system
+  targetType String
+  targetId String?
+  /// 变更前后 JSON
+  beforeJson String @default("{}")
+  afterJson String @default("{}")
+  ip String @default("")
+  userAgent String @default("")
+  requestId String @default("")
+  createdAt DateTime @default(now())
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([actor])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// 计量记录（按租户 × 日聚合）—— 多租户计费/配额依据
+// ---------------------------------------------------------------------------
+model UsageRecord {
+  id String @id @default(cuid())
+  tenantId String
+  /// YYYY-MM-DD（按租户时区，平台统一 UTC 日期）
+  date String
+
+  // ---- 计数器 ----
+  searchCount Int @default(0)
+  errorCount Int @default(0)
+  rateLimitedCount Int @default(0)
+  rerankCount Int @default(0)
+  unauthorizedCount Int @default(0)
+
+  // ---- 资源计量 ----
+  embedTokens Int @default(0)
+  rerankDocuments Int @default(0)
+  resultChunks Int @default(0)
+
+  // ---- 延迟聚合（用于 p50/p95 近似）----
+  latencySumMs Int @default(0)
+  latencyCount Int @default(0)
+  latencyMaxMs Int @default(0)
+  rerankLatencySumMs Int @default(0)
+  rerankLatencyCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, date])
+  @@index([date])
+}
+
+// ---------------------------------------------------------------------------
+// 管理员账户（管理后台登录）
+// ---------------------------------------------------------------------------
+model AdminUser {
+  id String @id @default(cuid())
+  username String @unique
+  /// bcrypt/argon2 哈希
+  passwordHash String
+  /// admin | viewer
+  role String @default("admin")
+  enabled Boolean @default(true)
+  lastLoginAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([username])
+}
+
+// ---------------------------------------------------------------------------
+// 管理后台会话
+// ---------------------------------------------------------------------------
+model AdminSession {
+  id String @id @default(cuid())
+  /// SHA-256(token) hex
+  tokenHash String @unique
+  subject String
+  /// 签发方式：password | bootstrap
+  issuedBy String @default("password")
+  expiresAt DateTime
+  ip String @default("")
+  userAgent String @default("")
+  createdAt DateTime @default(now())
+  revokedAt DateTime?
+
+  @@index([tokenHash])
+  @@index([expiresAt])
+}

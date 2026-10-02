@@ -1,0 +1,48 @@
+# dependencies
+node_modules
+/.pnp
+.pnp.*
+.yarn/*
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (禁止提交任何环境变量文件，包含密钥)
+.env
+.env.*
+!.env.example
+
+# local db & logs (禁止提交运行残留)
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+dev.log
+server.log
+*.log
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# local config / 临时数据
+local-*
+.claude
+.z-ai-config
+upload/
+download/
+workdir/
